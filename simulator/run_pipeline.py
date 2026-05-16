@@ -5,12 +5,9 @@ Simulates multiple DistilBERT training runs with injected failure modes:
   - Accuracy drift (validation accuracy regresses across epochs)
   - Clean run (baseline)
 
-Fixes applied (v2):
-  - P1: batch_size 16 → 8    (eliminates CUDA OOM on 8 GiB GPU)
-  - P2: warmup_steps = 500   (stabilises early training, prevents accuracy drift)
-  - P3: max_len 128 → 64     (halves tokenisation time, epoch fits within wall-clock budget)
-  - P4: epochs 3 → 5         (model not yet converged at epoch 3, trend +0.018/epoch)
-  - P5: learning_rate 2e-5 → 3e-5  (faster convergence toward 0.85 ceiling)
+Two modes:
+  apply_fixes=True  (default) — v2 fixes applied, all runs complete successfully
+  apply_fixes=False           — raw failures injected: OOM crashes, timeouts, real accuracy regression
 
 Each run writes a structured JSON log to ../logs/
 """
@@ -38,7 +35,7 @@ def _emit(events: list, level: str, message: str, **extra):
     events.append({"timestamp": _now(), "level": level, "message": message, **extra})
 
 
-def simulate_run(run_id: str, failure_mode: str, epochs: int = 5) -> dict:
+def simulate_run(run_id: str, failure_mode: str, epochs: int = 5, apply_fixes: bool = True) -> dict:
     """Return a complete run record (dict) with structured events."""
     events = []
     start_ts = _now()
@@ -47,93 +44,126 @@ def simulate_run(run_id: str, failure_mode: str, epochs: int = 5) -> dict:
         "model": "distilbert-base-uncased",
         "dataset": "chengxuphd/liar2",
         "epochs": epochs,
-        "batch_size": 8,          # P1 fix: was 16, reduced to avoid OOM on 8 GiB GPU
-        "learning_rate": 3e-5,    # P5 fix: was 2e-5, faster convergence toward accuracy ceiling
-        "warmup_steps": 500,      # P2 fix: was 0, linear warmup stabilises early training
-        "max_len": 64,            # P3 fix: was 128, halved to fit epoch within wall-clock budget
+        "batch_size":    8   if apply_fixes else 16,    # P1: was 16, OOM on 8 GiB GPU
+        "learning_rate": 3e-5 if apply_fixes else 2e-5, # P5: was 2e-5, slow convergence
+        "warmup_steps":  500  if apply_fixes else 0,    # P2: was 0, early accuracy drift
+        "max_len":       64   if apply_fixes else 128,  # P3: was 128, epoch timeout
     }
 
     _emit(events, "INFO", "Run started", run_id=run_id, failure_mode=failure_mode, config=config)
 
     epoch_metrics = []
-    # P5: LR 3e-5 yields ~+0.014/epoch gain vs +0.008 at 2e-5 (faster convergence)
-    # P4: 5 epochs let the model reach deeper into the 0.70–0.85 range
-    base_accuracy = 0.70
-    lr_gain_per_epoch = 0.014   # was 0.008 at lr=2e-5
-    base_loss = 0.55
-    completed = False
-    error = None
+    base_accuracy    = 0.70
+    lr_gain_per_epoch = 0.014 if apply_fixes else 0.008
+    base_loss        = 0.55
+    completed        = False
+    error            = None
+
+    # Pre-determine crash epoch for unfixed failures
+    crash_epoch = None
+    if not apply_fixes:
+        if failure_mode == "oom":
+            crash_epoch = random.randint(1, max(1, epochs // 2))
+        elif failure_mode == "timeout":
+            crash_epoch = random.randint(2, max(2, epochs - 1))
 
     for epoch in range(1, epochs + 1):
         _emit(events, "INFO", f"Epoch {epoch}/{epochs} started", epoch=epoch)
 
-        # --- Timeout: no longer triggered (max_len=64 halves per-epoch time) ---
-        # P3 fix applied: max_len reduced from 128 to 64
-        if failure_mode == "timeout":
-            _emit(
-                events,
-                "INFO",
-                "P3 fix active: max_len=64 — epoch duration within wall-clock budget, continuing",
-                epoch=epoch,
-                fix="max_len_reduced",
-            )
+        # ── Crash injection (unfixed) ──────────────────────────────────────────
 
-        # --- OOM: no longer triggered (batch_size=8 fits within 8 GiB) ---
-        # P1 fix applied: batch_size reduced from 16 to 8
-        if failure_mode == "oom":
-            _emit(
-                events,
-                "INFO",
-                "P1 fix active: batch_size=8 — OOM condition resolved, continuing training",
-                epoch=epoch,
-                fix="batch_size_reduced",
-            )
+        if failure_mode == "oom" and not apply_fixes and epoch == crash_epoch:
+            error = {
+                "type": "oom",
+                "epoch": epoch,
+                "detail": (
+                    f"CUDA out of memory at epoch {epoch}: "
+                    "batch_size=16 exhausted 8 GiB GPU RAM."
+                ),
+            }
+            _emit(events, "ERROR", f"CUDA OOM at epoch {epoch} — run aborted",
+                  epoch=epoch, error_type="oom")
+            break
 
-        # --- Simulate epoch duration ---
-        time.sleep(random.uniform(0.05, 0.15))  # fast simulation
+        if failure_mode == "timeout" and not apply_fixes and epoch == crash_epoch:
+            error = {
+                "type": "timeout",
+                "epoch": epoch,
+                "detail": (
+                    f"Epoch {epoch} exceeded wall-clock budget: "
+                    "max_len=128 tokenisation too slow."
+                ),
+            }
+            _emit(events, "ERROR", f"Timeout at epoch {epoch} — run aborted",
+                  epoch=epoch, error_type="timeout")
+            break
 
-        # --- Generate metrics ---
+        # ── Fix-active log messages ────────────────────────────────────────────
+
+        if apply_fixes:
+            if failure_mode == "timeout":
+                _emit(
+                    events, "INFO",
+                    "P3 fix active: max_len=64 — epoch duration within wall-clock budget, continuing",
+                    epoch=epoch, fix="max_len_reduced",
+                )
+            elif failure_mode == "oom":
+                _emit(
+                    events, "INFO",
+                    "P1 fix active: batch_size=8 — OOM condition resolved, continuing training",
+                    epoch=epoch, fix="batch_size_reduced",
+                )
+
+        # ── Simulate epoch duration ────────────────────────────────────────────
+
+        time.sleep(random.uniform(0.05, 0.15))
+
+        # ── Generate metrics ───────────────────────────────────────────────────
+
         noise = random.gauss(0, 0.012)
 
         if failure_mode == "accuracy_drift":
-            # P2+P5: warmup + higher LR → stable convergence, no drift
-            warmup_penalty = max(0.0, 0.015 - (epoch - 1) * 0.015)
-            accuracy = base_accuracy + (epoch - 1) * (lr_gain_per_epoch * 0.8) - warmup_penalty + noise
+            if apply_fixes:
+                # P2+P5: warmup + higher LR → stable convergence, no drift
+                warmup_penalty = max(0.0, 0.015 - (epoch - 1) * 0.015)
+                accuracy = base_accuracy + (epoch - 1) * (lr_gain_per_epoch * 0.8) - warmup_penalty + noise
+            else:
+                # Unfixed: genuine regression (-0.025/epoch)
+                accuracy = base_accuracy - (epoch - 1) * 0.025 + noise
         else:
             # Logarithmic saturation: gains taper off as accuracy approaches ceiling 0.85
-            raw_gain = (epoch - 1) * lr_gain_per_epoch
+            raw_gain   = (epoch - 1) * lr_gain_per_epoch
             saturation = 1 - (base_accuracy + raw_gain - 0.70) / (0.85 - 0.70)
             saturation = max(0.2, saturation)
-            accuracy = base_accuracy + raw_gain * saturation + noise
+            accuracy   = base_accuracy + raw_gain * saturation + noise
 
-        # Higher LR reduces loss faster, but slightly noisier
         train_loss = base_loss - (epoch - 1) * 0.08 + random.gauss(0, 0.015)
-        val_loss = train_loss + random.gauss(0.04, 0.01)
-        f1 = accuracy - random.uniform(0.005, 0.02)
-        precision = f1 + random.gauss(0, 0.01)
-        recall = f1 + random.gauss(0, 0.01)
-        auc_roc = accuracy + random.gauss(0.07, 0.005)
+        val_loss   = train_loss + random.gauss(0.04, 0.01)
+        f1         = accuracy - random.uniform(0.005, 0.02)
+        precision  = f1 + random.gauss(0, 0.01)
+        recall     = f1 + random.gauss(0, 0.01)
+        auc_roc    = accuracy + random.gauss(0.07, 0.005)
 
         metrics = {
-            "epoch": epoch,
+            "epoch":      epoch,
             "train_loss": round(train_loss, 4),
-            "val_loss": round(val_loss, 4),
-            "accuracy": round(accuracy, 4),
-            "f1": round(f1, 4),
-            "precision": round(precision, 4),
-            "recall": round(recall, 4),
-            "auc_roc": round(min(auc_roc, 0.99), 4),
+            "val_loss":   round(val_loss, 4),
+            "accuracy":   round(accuracy, 4),
+            "f1":         round(f1, 4),
+            "precision":  round(precision, 4),
+            "recall":     round(recall, 4),
+            "auc_roc":    round(min(auc_roc, 0.99), 4),
         }
         epoch_metrics.append(metrics)
 
-        # --- Accuracy drift check (P2 fix should prevent this from triggering) ---
+        # ── Accuracy drift check ───────────────────────────────────────────────
+
         if failure_mode == "accuracy_drift" and epoch >= 2:
             prev_acc = epoch_metrics[-2]["accuracy"]
             drop = prev_acc - accuracy
             if drop > 0.01:
                 _emit(
-                    events,
-                    "WARNING",
+                    events, "WARNING",
                     f"Accuracy drift detected: -{drop:.3f} vs previous epoch",
                     epoch=epoch,
                     accuracy=round(accuracy, 4),
@@ -141,13 +171,11 @@ def simulate_run(run_id: str, failure_mode: str, epochs: int = 5) -> dict:
                     drop=round(drop, 4),
                     error_type="accuracy_drift",
                 )
-            else:
+            elif apply_fixes:
                 _emit(
-                    events,
-                    "INFO",
+                    events, "INFO",
                     "P2 fix active: warmup_steps=500 — accuracy stable, no drift detected",
-                    epoch=epoch,
-                    fix="warmup_steps_added",
+                    epoch=epoch, fix="warmup_steps_added",
                 )
 
         _emit(events, "INFO", f"Epoch {epoch}/{epochs} completed", **metrics)
@@ -159,20 +187,20 @@ def simulate_run(run_id: str, failure_mode: str, epochs: int = 5) -> dict:
     end_ts = _now()
 
     record = {
-        "run_id": run_id,
-        "failure_mode": failure_mode,
-        "status": "completed" if completed else "failed",
-        "error": error,
-        "started_at": start_ts,
-        "ended_at": end_ts,
-        "config": config,
+        "run_id":        run_id,
+        "failure_mode":  failure_mode,
+        "status":        "completed" if completed else "failed",
+        "error":         error,
+        "started_at":    start_ts,
+        "ended_at":      end_ts,
+        "config":        config,
         "epoch_metrics": epoch_metrics,
-        "events": events,
+        "events":        events,
     }
     return record
 
 
-def run_all(n_runs: int = 6) -> list[Path]:
+def run_all(n_runs: int = 6, apply_fixes: bool = True) -> list[Path]:
     """Simulate n_runs and write each to a JSON file. Returns list of log paths."""
     modes = [FAILURE_MODES[i % len(FAILURE_MODES)] for i in range(n_runs)]
     random.shuffle(modes)
@@ -180,8 +208,8 @@ def run_all(n_runs: int = 6) -> list[Path]:
     paths = []
     for i, mode in enumerate(modes):
         run_id = f"run_{i+1:03d}_{uuid.uuid4().hex[:6]}"
-        print(f"[simulator] {run_id}  mode={mode}")
-        record = simulate_run(run_id, mode)
+        print(f"[simulator] {run_id}  mode={mode}  apply_fixes={apply_fixes}")
+        record = simulate_run(run_id, mode, apply_fixes=apply_fixes)
 
         log_path = LOGS_DIR / f"{run_id}.json"
         log_path.write_text(json.dumps(record, indent=2))

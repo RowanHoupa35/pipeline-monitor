@@ -1,15 +1,17 @@
 """
 LLM agent: sends a structured anomaly digest to a local Ollama instance
-and returns a human-readable alert summary and recommended action.
+and returns a human-readable alert summary and recommended actions.
 
 Provider: Ollama (local, no API key required)
-Model:    qwen2.5:3b  (configurable via OLLAMA_MODEL env var)
-Endpoint: http://localhost:11434  (network_mode: host in Docker)
+Model:    qwen3:8b (configurable via OLLAMA_MODEL env var)
+Endpoint: http://localhost:11434 (network_mode: host in Docker)
 """
 
 import json
 import os
+import re
 from dataclasses import asdict
+from typing import Generator
 
 import httpx
 
@@ -18,75 +20,108 @@ from .health_scorer import HealthReport
 
 
 _OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-_MODEL       = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
+_MODEL       = os.environ.get("OLLAMA_MODEL", "qwen3:8b")
+
+_SYSTEM_PROMPT = """You are an MLOps monitoring agent specialized in DistilBERT training pipelines \
+on the fake-news detection task (liar2 dataset, baseline accuracy ~0.70).
+
+Given the JSON digest below, write a report in English structured as follows:
+1. A concise **executive summary** describing the overall pipeline health in clear, natural language.
+2. For each critical or degraded run: a root cause and a concrete **recommended action**.
+3. A **priority alert**  if any run scored below 40.
+
+Be specific, technical, and actionable but also keep in mind that the audience may not be full technical so adjust it.."""
 
 
 # ── Prompt builder ──────────────────────────────────────────────────────────
 
-def _build_prompt(records: list[RunRecord], reports: list[HealthReport]) -> str:
+def _build_user_prompt(records: list[RunRecord], reports: list[HealthReport]) -> str:
     digest = []
     for rec, rep in zip(records, reports):
         digest.append({
-            "run_id": rec.run_id,
-            "status": rec.status,
-            "failure_mode": rec.failure_mode,
-            "health_score": rep.score,
-            "health_status": rep.status,
+            "run_id":           rec.run_id,
+            "status":           rec.status,
+            "failure_mode":     rec.failure_mode,
+            "health_score":     rep.score,
+            "health_status":    rep.status,
             "epochs_completed": f"{rec.epochs_completed}/{rec.expected_epochs}",
-            "final_accuracy": rec.final_accuracy,
-            "accuracy_trend": rec.accuracy_trend,
-            "score_breakdown": rep.breakdown,
-            "detected_alerts": rep.alerts,
-            "error": asdict(rec.error) if rec.error else None,
+            "final_accuracy":   rec.final_accuracy,
+            "accuracy_trend":   rec.accuracy_trend,
+            "score_breakdown":  rep.breakdown,
+            "detected_alerts":  rep.alerts,
+            "error":            asdict(rec.error) if rec.error else None,
         })
 
-    return f"""You are an MLOps monitoring agent. Below is a JSON digest of recent \
-DistilBERT training runs on the fake-news detection pipeline (liar2 dataset, baseline \
-accuracy ~0.70).
-
-Each run has a health score (0-100) and detected anomalies. Your job is to:
-1. Write a concise **executive summary** (3-5 sentences) of the overall pipeline health.
-2. List each critical or degraded run with a one-line root-cause and **recommended action**.
-3. End with a **priority alert** (one sentence) if any run scored below 40.
-
-Be specific, technical, and actionable. Format your response in Markdown.
-
---- PIPELINE DIGEST ---
-{json.dumps(digest, indent=2)}
---- END DIGEST ---"""
+    return (
+        "Below is a JSON digest of recent DistilBERT training runs "
+        "on the fake-news detection pipeline.\n\n"
+        f"--- PIPELINE DIGEST ---\n{json.dumps(digest, indent=2)}\n--- END DIGEST ---"
+    )
 
 
 # ── Public API ──────────────────────────────────────────────────────────────
+
+def _make_payload(prompt: str, model: str, stream: bool) -> dict:
+    return {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user",   "content": prompt},
+        ],
+        "stream":  stream,
+        "think":   False,
+        "options": {"num_predict": 2048},
+    }
+
+
+def generate_alert_stream(
+    records: list[RunRecord],
+    reports: list[HealthReport],
+    model: str = _MODEL,
+) -> Generator[str, None, None]:
+    """
+    Yield text chunks from the Ollama streaming API.
+    Falls back to yielding the full fallback summary in one shot on error.
+    """
+    prompt = _build_user_prompt(records, reports)
+    url    = f"{_OLLAMA_HOST.rstrip('/')}/api/chat"
+
+    try:
+        with httpx.stream("POST", url, json=_make_payload(prompt, model, stream=True),
+                          timeout=180.0) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                try:
+                    chunk = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                content = chunk.get("message", {}).get("content", "")
+                if content:
+                    yield content
+                if chunk.get("done"):
+                    break
+
+    except httpx.ConnectError as e:
+        yield _fallback_summary(records, reports, reason=f"Ollama unreachable ({e})")
+    except httpx.HTTPStatusError as e:
+        yield _fallback_summary(
+            records, reports,
+            reason=f"Ollama error {e.response.status_code}: {e.response.text[:120]}",
+        )
+    except Exception as e:
+        yield _fallback_summary(records, reports, reason=str(e))
+
 
 def generate_alert(
     records: list[RunRecord],
     reports: list[HealthReport],
     model: str = _MODEL,
 ) -> str:
-    """
-    Call the local Ollama REST API and return a Markdown-formatted alert summary.
-    Falls back to a rule-based summary if Ollama is unreachable.
-    """
-    prompt = _build_prompt(records, reports)
-    url = f"{_OLLAMA_HOST.rstrip('/')}/api/chat"
-
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "stream": False,
-    }
-
-    try:
-        response = httpx.post(url, json=payload, timeout=120.0)
-        response.raise_for_status()
-        return response.json()["message"]["content"]
-
-    except httpx.ConnectError as e:
-        return _fallback_summary(records, reports, reason=f"Ollama unreachable ({e})")
-    except httpx.HTTPStatusError as e:
-        return _fallback_summary(records, reports, reason=f"Ollama error {e.response.status_code}: {e.response.text[:120]}")
-    except Exception as e:
-        return _fallback_summary(records, reports, reason=str(e))
+    """Non-streaming version — joins all chunks and strips qwen3 thinking blocks."""
+    content = "".join(generate_alert_stream(records, reports, model))
+    return re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
 
 
 def _fallback_summary(

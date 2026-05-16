@@ -16,7 +16,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
 
-from agent import load_all_runs, score_all, generate_alert
+from agent import load_all_runs, score_all, generate_alert_stream
 from simulator.run_pipeline import run_all
 
 LOGS_DIR = Path(__file__).parent.parent / "logs"
@@ -35,9 +35,11 @@ with st.sidebar:
     st.divider()
 
     n_runs = st.slider("Runs to simulate", 3, 12, 6)
+    apply_fixes = st.checkbox("Apply v2 fixes (all runs succeed)", value=True)
     if st.button("▶ Run simulator", use_container_width=True):
         with st.spinner("Simulating training runs…"):
-            run_all(n_runs)
+            run_all(n_runs, apply_fixes=apply_fixes)
+        st.session_state.pop("alert_text", None)  # invalidate stale LLM alert
         st.success("Simulation complete!")
         st.rerun()
 
@@ -46,7 +48,7 @@ with st.sidebar:
         st.session_state["generate_alert"] = True
 
     st.divider()
-    st.caption("Stack: DistilBERT · Anthropic API · Docker · Streamlit")
+    st.caption("Stack: DistilBERT · Ollama · qwen3:8b · Docker · Streamlit")
 
 # ── Load data ──────────────────────────────────────────────────────────────────
 log_files = list(LOGS_DIR.glob("*.json"))
@@ -85,16 +87,17 @@ st.subheader("Run Summary")
 table_rows = []
 for rec, rep in zip(records, reports):
     status_icon = {"healthy": "✅", "degraded": "⚠️", "critical": "❌"}.get(rep.status, "?")
+    last = rec.epoch_metrics[-1] if rec.epoch_metrics else None
     table_rows.append({
         "Run ID": rec.run_id,
         "Status": f"{status_icon} {rep.status}",
         "Score": rep.score,
         "Failure mode": rec.failure_mode,
         "Epochs": f"{rec.epochs_completed}/{rec.expected_epochs}",
-        "Final accuracy": f"{rec.final_accuracy:.4f}" if rec.final_accuracy else "–",
-        "Trend": (
-            f"{rec.accuracy_trend:+.4f}" if rec.accuracy_trend is not None else "–"
-        ),
+        "Accuracy": f"{rec.final_accuracy:.4f}" if rec.final_accuracy else "–",
+        "F1": f"{last.f1:.4f}" if last else "–",
+        "Val loss": f"{last.val_loss:.4f}" if last else "–",
+        "Trend": f"{rec.accuracy_trend:+.4f}" if rec.accuracy_trend is not None else "–",
         "Alerts": len(rep.alerts),
     })
 
@@ -170,8 +173,19 @@ for rec, rep in zip(records, reports):
     with st.expander(f"{icon} {rec.run_id} — score {rep.score}/100"):
         c1, c2, c3 = st.columns(3)
         c1.metric("Completion", f"{rec.epochs_completed}/{rec.expected_epochs}")
-        c2.metric("Score", rep.score)
+        c2.metric("Score", f"{rep.score}/100")
         c3.metric("Mode", rec.failure_mode)
+
+        # Score breakdown per dimension
+        st.markdown("**Score breakdown:**")
+        bd = rep.breakdown
+        b1, b2, b3, b4, b5, b6 = st.columns(6)
+        b1.metric("Completion", f"{bd.get('completion', 0)}/25")
+        b2.metric("Accuracy",   f"{bd.get('accuracy',   0)}/20")
+        b3.metric("F1",         f"{bd.get('f1',         0)}/10")
+        b4.metric("Trend",      f"{bd.get('trend',      0)}/15")
+        b5.metric("Val loss",   f"{bd.get('val_loss',   0)}/15")
+        b6.metric("Errors",     f"{bd.get('errors',     0)}/15")
 
         if rep.alerts:
             st.markdown("**Detected alerts:**")
@@ -200,11 +214,9 @@ st.subheader("🤖 LLM-Generated Alert")
 
 if st.session_state.get("generate_alert"):
     st.session_state["generate_alert"] = False
-    with st.spinner("Calling Anthropic API…"):
-        alert_text = generate_alert(records, reports)
+    alert_text = st.write_stream(generate_alert_stream(records, reports))
     st.session_state["alert_text"] = alert_text
-
-if "alert_text" in st.session_state:
+elif "alert_text" in st.session_state:
     st.markdown(st.session_state["alert_text"])
 else:
     st.info("Click **Generate LLM alert** in the sidebar to get an AI-powered anomaly summary.")
